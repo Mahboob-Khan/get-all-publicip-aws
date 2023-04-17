@@ -1,38 +1,48 @@
 import boto3
 import csv
+import os
 
-# Open the CSV file containing a list of AWS account IDs
-with open('aws_accounts.csv', 'r') as csvfile:
-    reader = csv.DictReader(csvfile)
-    # Create a list to store the public IP addresses
+def lambda_handler(event, context):
+    # Get the S3 bucket and key for the input CSV file
+    bucket_name = event['Records'][0]['s3']['bucket']['name']
+    key = event['Records'][0]['s3']['object']['key']
+    
+    # Download the input CSV file from S3
+    s3 = boto3.resource('s3')
+    bucket = s3.Bucket(bucket_name)
+    bucket.download_file(key, '/tmp/input.csv')
+    
+    # Read the list of AWS accounts from the input CSV file
+    accounts = []
+    with open('/tmp/input.csv', 'r') as csvfile:
+        reader = csv.reader(csvfile)
+        for row in reader:
+            accounts.append({'account_id': row[0], 'role_arn': row[1]})
+    
+    # Retrieve the public IPs of all network interfaces in each AWS account
+    ec2 = boto3.client('ec2')
     public_ips = []
-    # Iterate through each row in the CSV file
-    for row in reader:
-        account_id = row['account_id']
-        # Create a new session for the AWS account
-        session = boto3.Session(profile_name=f'aws-account-{account_id}')
-        # Create an EC2 client object for the AWS account
-        ec2 = session.client('ec2')
-        # Retrieve a list of all network interfaces in the AWS account
-        response = ec2.describe_network_interfaces()
-        # Iterate through each network interface in the response
-        for network_interface in response['NetworkInterfaces']:
-            # Check if the network interface has a public IP address
-            if 'Association' in network_interface and 'PublicIp' in network_interface['Association']:
-                public_ip = network_interface['Association']['PublicIp']
-                # Append the public IP address to the list
-                public_ips.append({
-                    'aws_account': account_id,
-                    'network_interface_id': network_interface['NetworkInterfaceId'],
-                    'public_ip': public_ip
-                })
-
-# Open a new CSV file to write the public IP addresses
-with open('public_ips.csv', 'w', newline='') as csvfile:
-    writer = csv.DictWriter(csvfile, fieldnames=['aws_account', 'network_interface_id', 'public_ip'])
-    writer.writeheader()
-    # Write each public IP address to the CSV file
-    for public_ip in public_ips:
-        writer.writerow(public_ip)
-
-print("Public IP addresses exported to public_ips.csv.")
+    for account in accounts:
+        sts = boto3.client('sts')
+        assumed_role = sts.assume_role(
+            RoleArn=account['role_arn'],
+            RoleSessionName='AssumeRoleSession'
+        )
+        credentials = assumed_role['Credentials']
+        ec2 = boto3.client('ec2',
+                           aws_access_key_id=credentials['AccessKeyId'],
+                           aws_secret_access_key=credentials['SecretAccessKey'],
+                           aws_session_token=credentials['SessionToken'])
+        response = ec2.describe_network_interfaces(Filters=[{'Name': 'addresses.public-ip', 'Values': ['*']}])
+        for interface in response['NetworkInterfaces']:
+            for address in interface['PrivateIpAddresses']:
+                if 'Association' in address and 'PublicIp' in address['Association']:
+                    public_ips.append({'account_id': account['account_id'], 'public_ip': address['Association']['PublicIp']})
+    
+    # Export the public IPs to a CSV file and upload it to S3
+    with open('/tmp/public_ips.csv', 'w') as csvfile:
+        writer = csv.writer(csvfile)
+        for row in public_ips:
+            writer.writerow([row['account_id'], row['public_ip']])
+    
+    s3.meta.client.upload_file('/tmp/public_ips.csv', bucket_name, 'public_ips.csv')
